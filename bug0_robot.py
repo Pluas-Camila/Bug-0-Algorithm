@@ -5,7 +5,7 @@ from robot_systems.robot import HamBot
 # -----------------------------
 # CONFIGURATION PARAMETERS
 # -----------------------------
-GOAL_COLOR = [(255, 255, 0)]   # Yellow cylinder
+GOAL_COLOR = [(255, 105, 180)]  # Pink cylinder
 COLOR_TOLERANCE = 0.08
 AREA_THRESHOLD = 500           # Minimum landmark size
 LIDAR_FRONT_INDEX = 180
@@ -108,3 +108,4 @@ def main():
 # -----------------------------
 if __name__ == "__main__":
     main()
+
