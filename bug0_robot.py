@@ -1,111 +1,119 @@
-import time
-import math
 from robot_systems.robot import HamBot
+import time
 
 # -----------------------------
 # CONFIGURATION PARAMETERS
 # -----------------------------
-GOAL_COLOR = [(255, 105, 180)]  # Pink cylinder
-COLOR_TOLERANCE = 0.08
-AREA_THRESHOLD = 500           # Minimum landmark size
-LIDAR_FRONT_INDEX = 180
-OBSTACLE_THRESHOLD = 300       # mm, stop distance in front
-MOTOR_SPEED = 50               # Motor speed
-STEP_DURATION = 0.2            # seconds per incremental move
-GOAL_RADIUS = 0.25             # meters, success distance
+
+# Goal detection colors (pink shades)
+GOAL_COLORS = [(255, 105, 180), (255, 192, 203), (255, 20, 147)]
+COLOR_TOLERANCE = 0.12
+AREA_THRESHOLD = 400  # minimum landmark area in pixels
+
+# LIDAR thresholds (in mm)
+FRONT_OBSTACLE_THRESHOLD = 300  # obstacle detected within 30 cm
+
+# Motion parameters
+FORWARD_SPEED = 50  # motor speed
+TURN_SPEED = 30     # motor turn speed
+TIME_STEP = 0.1     # control loop interval
 
 # -----------------------------
 # HELPER FUNCTIONS
 # -----------------------------
-def obstacle_detected(robot):
-    """Check if there is an obstacle in front using LIDAR."""
-    scan = robot.get_lidar_range_image()
-    front_distance = scan[LIDAR_FRONT_INDEX]
-    return front_distance < OBSTACLE_THRESHOLD
 
 def goal_visible(robot):
-    """Check if the yellow goal is visible in camera frame."""
+    """Check if the pink goal is visible in camera frame."""
     landmarks = robot.find_landmarks(area_threshold=AREA_THRESHOLD)
-    return len(landmarks) > 0
+    return len(landmarks) > 0, landmarks
 
-def move_toward_goal(robot):
-    """Drive forward by a small step."""
-    robot.set_left_speed(-MOTOR_SPEED)   # left motor reversed
-    robot.set_right_speed(MOTOR_SPEED)   # right motor forward
-    time.sleep(STEP_DURATION)
-    robot.stop_motors()
+def distance_to_obstacle(lidar_data, angle=180):
+    """Return distance to obstacle at given lidar angle (default: front)."""
+    return lidar_data[angle]
 
-def follow_wall(robot):
-    """Simple wall-following behavior (right-hand)."""
-    scan = robot.get_lidar_range_image()
-    front = scan[180]
-    right = scan[270]
+def drive_toward_goal(robot, landmarks):
+    """Proportional steering toward goal landmark in camera frame."""
+    if not landmarks:
+        robot.set_left_speed(FORWARD_SPEED)
+        robot.set_right_speed(FORWARD_SPEED)
+        return
     
-    if front < OBSTACLE_THRESHOLD:
-        # Turn left if blocked in front
-        robot.set_left_speed(-MOTOR_SPEED)
-        robot.set_right_speed(-MOTOR_SPEED//2)
-    elif right > OBSTACLE_THRESHOLD + 50:
-        # Steer right to stay close to wall
-        robot.set_left_speed(-MOTOR_SPEED)
-        robot.set_right_speed(MOTOR_SPEED//2)
+    target = max(landmarks, key=lambda lm: lm.width * lm.height)
+    img_center_x = 640 / 2  # assuming camera resolution width
+    error_x = target.center_x - img_center_x
+
+    # proportional steering
+    Kp = 0.1
+    turn_adjust = Kp * error_x
+    left_speed = FORWARD_SPEED - turn_adjust
+    right_speed = FORWARD_SPEED + turn_adjust
+
+    # clamp speeds
+    left_speed = max(min(left_speed, 100), -100)
+    right_speed = max(min(right_speed, 100), -100)
+
+    robot.set_left_speed(left_speed)
+    robot.set_right_speed(right_speed)
+
+def wall_following(robot, lidar_data):
+    """Simple wall-following behavior."""
+    left_dist = distance_to_obstacle(lidar_data, 90)
+    right_dist = distance_to_obstacle(lidar_data, 270)
+    front_dist = distance_to_obstacle(lidar_data, 180)
+
+    if front_dist < FRONT_OBSTACLE_THRESHOLD:
+        if left_dist > right_dist:
+            robot.set_left_speed(-TURN_SPEED)
+            robot.set_right_speed(TURN_SPEED)
+        else:
+            robot.set_left_speed(TURN_SPEED)
+            robot.set_right_speed(-TURN_SPEED)
     else:
-        # Drive straight
-        robot.set_left_speed(-MOTOR_SPEED)
-        robot.set_right_speed(MOTOR_SPEED)
-    
-    time.sleep(STEP_DURATION)
-    robot.stop_motors()
-
-def reached_goal(robot):
-    """Check if robot is within GOAL_RADIUS of goal."""
-    landmarks = robot.find_landmarks(area_threshold=AREA_THRESHOLD)
-    return len(landmarks) > 0  # Can refine using distance estimate
+        robot.set_left_speed(FORWARD_SPEED / 2)
+        robot.set_right_speed(FORWARD_SPEED / 2)
 
 # -----------------------------
-# MAIN FUNCTION
+# MAIN LOOP
 # -----------------------------
+
 def main():
-    # Initialize robot with sensors enabled
     robot = HamBot(lidar_enabled=True, camera_enabled=True)
-    
-    # Set camera to detect goal color
-    robot.set_landmark_colors(GOAL_COLOR, tolerance=COLOR_TOLERANCE)
-    
-    state = "MG"  # Motion to Goal
+    time.sleep(1)  # allow sensors to initialize
+
+    # Set pink goal detection using built-in function
+    robot.set_landmark_colors(GOAL_COLORS, tolerance=COLOR_TOLERANCE)
+
+    state = "MG"  # start with Motion-to-Goal
 
     try:
         while True:
-            if reached_goal(robot):
-                print("Goal Reached!")
-                robot.stop_motors()
-                break
-            
-            if state == "MG":
-                if obstacle_detected(robot):
-                    print("Obstacle detected! Switching to Wall-Following.")
-                    state = "WF"
-                else:
-                    print("Motion to Goal...")
-                    move_toward_goal(robot)
-            
-            elif state == "WF":
-                if goal_visible(robot):
-                    print("Line-of-sight to goal clear! Switching to Motion-to-Goal.")
-                    state = "MG"
-                else:
-                    print("Wall Following...")
-                    follow_wall(robot)
-            
-            time.sleep(0.05)  # small delay to prevent busy loop
+            lidar_data = robot.get_range_image()
+            visible, landmarks = goal_visible(robot)
 
+            if state == "MG":
+                if distance_to_obstacle(lidar_data) < FRONT_OBSTACLE_THRESHOLD:
+                    state = "WF"
+                elif visible:
+                    drive_toward_goal(robot, landmarks)
+                else:
+                    robot.set_left_speed(FORWARD_SPEED)
+                    robot.set_right_speed(FORWARD_SPEED)
+
+            elif state == "WF":
+                wall_following(robot, lidar_data)
+                if visible:
+                    state = "MG"
+
+            time.sleep(TIME_STEP)
+
+    except KeyboardInterrupt:
+        print("Stopping robot.")
     finally:
-        # Stop everything safely
         robot.stop_motors()
 
 # -----------------------------
-# RUN MAIN
+# ENTRY POINT
 # -----------------------------
+
 if __name__ == "__main__":
     main()
-
