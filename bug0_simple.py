@@ -1,325 +1,337 @@
-# bug0_pink_simple.py
-# -------------------------------------------------------------
-# Bug 0 (Pink-first) for HamBot:
-#  - GOAL_SEEK: face & drive toward a pink landmark
-#  - WALL_FOLLOW: very simple left-follow when blocked
-#  - Prints explicit [GOAL DETECTED]/[GOAL LOST] messages
-# -------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+bug0_simple.py - Simplified Bug Zero
 
-import time, math, traceback
+Drive straight toward goal when visible.
+Wall follow when blocked.
+"""
+
+import time
+import numpy as np
 from robot_systems.robot import HamBot
-from robot_systems.camera import Camera
 
-# ---------------------------- Tunables ----------------------------
+# ============================================================================
+# TUNABLE PARAMETERS
+# ============================================================================
 
-DT = 0.03  # control loop period
+# Goal detection
+GOAL_RGB = (245, 0, 124)  # Pink cylinder
+GOAL_TOL = 0.25           # ±25% tolerance
+GOAL_AREA = 400           # minimum pixel area
 
-# LIDAR thresholds (meters)
-STOP_HARD     = 0.15
-TURN_TRIGGER  = 0.45
-FRONT_CLEAR   = 0.70
-TARGET_SIDE   = 0.30
-SIDE_TOO_FAR  = 0.45
-SIDE_TOO_NEAR = 0.22
+# LIDAR indices (0=back, 90=left, 180=front, 270=right)
+FRONT_CENTER = 180
+FRONT_SECTOR = 20
+LEFT_CENTER = 90
+LEFT_SECTOR = 15
+RIGHT_CENTER = 270
+RIGHT_SECTOR = 15
 
-# Motor speeds (RPM)
-MAX_RPM       = 70.0
-CRUISE_GOAL   = 26.0
-CRUISE_WALL   = 22.0
-ARC_FAST      = 22.0
-ARC_SLOW      =  8.0
-SEARCH_RPM    = 16.0
-BACK_RPM      = 20.0
-BACK_T        = 0.25
+# Distances (mm)
+STOP_HARD = 150
+GOAL_REACHED = 250
+OBSTACLE_CLOSE = 400
+FRONT_CLEAR = 600
+TARGET_SIDE = 350
+WALL_GONE = 1500
 
-# Camera / pink detection
-IMG_W, IMG_H  = 640, 480
-PINKS = [
-    (255, 105, 180),
-    (255,  20, 147),
-    (255,   0, 180),
-    (255,   0, 255),
-    (240,  50, 160),
-]
-BASE_TOL      = 0.10
-MAX_TOL       = 0.20
-MIN_AREA      = 200
-NO_GOAL_WIDEN = 30
-NO_GOAL_SHRINK= 60
+# Speeds
+FORWARD_SPEED = 30
+WALL_SPEED = 25
+SEARCH_SPEED = 20
+BACKUP_SPEED = -25
+ALIGN_SPEED = 15          # Slow speed for alignment
+CENTER_TOLERANCE = 40     # pixels - goal must be within this range of center (320±40)
 
-HEADING_K     = 0.6
-GOAL_LOCK_ERR = 0.18
-GOAL_NEAR_H   = 220  # stop when bbox height suggests we’re close enough
+# Wall following
+WALL_P = 0.05
+WALL_D = 0.02
 
-# Indices for sectors
-FRONT_S = slice(160, 200)
-LEFT_S  = slice( 90, 116)
-RIGHT_S = slice(244, 280)
-BACK_S  = slice(355, 360)
+# Timing
+LOOP_DT = 0.1
+SEARCH_TIME = 18
 
-# States
-GOAL_SEEK   = 0
-WALL_FOLLOW = 1
+# Camera
+CAM_WIDTH = 640
 
-# ---------------------------- Helpers ----------------------------
+# ============================================================================
+# STATES
+# ============================================================================
+STATE_SEARCH = "SEARCH"
+STATE_GOAL_SEEK = "GOAL_SEEK"
+STATE_WALL_FOLLOW = "WALL_FOLLOW"
 
-def clamp(x, lo, hi): 
-    return max(lo, min(hi, x))
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
-def _median(xs):
-    ys = sorted(xs)
-    return ys[len(ys)//2] if ys else float("inf")
-
-def safe_min(vals, fallback=float("inf")):
-    good = []
-    for v in vals:
-        try:
-            fv = float(v)
-        except:
-            continue
-        if fv > 0.0 and math.isfinite(fv):
-            good.append(fv)
-    return min(good) if good else fallback
-
-def normalize_scan_to_m(scan):
-    """Auto-detect units (mm/cm/m) per frame and return meters."""
-    if not scan or isinstance(scan, int):
-        return [float("inf")] * 360
-    samples = [v for v in scan if v > 0.0]
-    if not samples:
-        return [float("inf")] * len(scan)
-    med = _median(samples[:min(200, len(samples))])
-    if med > 50.0:   s = 0.001
-    elif med > 5.0:  s = 0.01
-    else:            s = 1.0
-    out = []
-    for v in scan:
-        if v <= 0.0:
-            out.append(float("inf"))
-        else:
-            m = v * s
-            out.append(m if m < 20.0 else float("inf"))
-    return out
-
-def parse_boxes(lms):
-    """Normalize find_landmarks() output into a list of (x,y,w,h)."""
-    boxes = []
-    if not lms:
-        return boxes
-    for lm in lms:
-        if isinstance(lm, (list, tuple)) and len(lm) >= 4:
-            x,y,w,h = lm[:4]
-            boxes.append((int(x), int(y), int(w), int(h)))
-        elif isinstance(lm, dict):
-            if "bbox" in lm:
-                x,y,w,h = lm["bbox"][:4]
-                boxes.append((int(x), int(y), int(w), int(h)))
-            elif "box" in lm:
-                x,y,w,h = lm["box"][:4]
-                boxes.append((int(x), int(y), int(w), int(h)))
-            elif all(k in lm for k in ("x","y","w","h")):
-                boxes.append((int(lm["x"]), int(lm["y"]), int(lm["w"]), int(lm["h"])))
-    return boxes
-
-def heading_error_from_box(box, img_w=IMG_W):
-    """Normalized horizontal error in [-1, +1]. +err => target to RIGHT."""
-    x, y, w, h = box
-    cx = img_w * 0.5
-    blob_cx = x + 0.5 * w
-    pix_err = blob_cx - cx
-    return clamp(pix_err / max(cx, 1.0), -1.0, 1.0)
-
-def stop(bot):
-    bot.set_left_motor_speed(0)
-    bot.set_right_motor_speed(0)
-
-def backup(bot, away_from_left=True):
-    """Short reverse, then small pivot away from obstacle."""
-    bot.set_left_motor_speed(-BACK_RPM)
-    bot.set_right_motor_speed(-BACK_RPM)
-    time.sleep(BACK_T)
-    if away_from_left:
-        bot.set_left_motor_speed(+SEARCH_RPM)
-        bot.set_right_motor_speed(-SEARCH_RPM)
+def get_sector_min(scan, center_idx, sector_width):
+    """Get minimum valid distance in a sector."""
+    start = (center_idx - sector_width) % 360
+    end = (center_idx + sector_width) % 360
+    
+    if start < end:
+        sector = scan[start:end+1]
     else:
-        bot.set_left_motor_speed(-SEARCH_RPM)
-        bot.set_right_motor_speed(+SEARCH_RPM)
-    time.sleep(0.20)
-    stop(bot)
+        sector = scan[start:] + scan[:end+1]
+    
+    valid = [d for d in sector if d > 0]
+    return min(valid) if len(valid) > 0 else None
 
-# ---------------------------- Main ----------------------------
+# ============================================================================
+# MAIN CONTROLLER
+# ============================================================================
 
 def main():
+    print("[INIT] Starting Bug-0 Controller")
+    
+    # Initialize robot
     bot = HamBot(lidar_enabled=True, camera_enabled=True)
-    cam = None
-    tol = BASE_TOL
-    no_goal_frames = 0
-    yes_goal_frames = 0
-    have_pink = False  # <-- NEW: detection state flag
-
-    try:
-        cam = Camera(fps=5, resolution=(IMG_W, IMG_H))
-        cam.set_landmark_colors(PINKS, tolerance=tol)
-        time.sleep(0.3)
-    except Exception as e:
-        print("[WARN] Camera init failed; running without vision.")
-        print(e)
-        print(traceback.format_exc())
-        cam = None
-
-    state = GOAL_SEEK
-    print("[Bug0] start. Pink-first; pivots toward pink when tight; simple left wall-follow.")
-
+    print("[INIT] HamBot initialized")
+    
+    # Use built-in camera
+    cam = bot.camera
+    cam.set_target_colors([GOAL_RGB], tolerance=GOAL_TOL)
+    print(f"[INIT] Camera configured for PINK goal {GOAL_RGB}")
+    
+    time.sleep(0.8)
+    
+    # State variables
+    state = STATE_SEARCH
+    search_timer = 0
+    last_side_dist = None
+    goal_lost_count = 0
+    GOAL_LOST_THRESHOLD = 10
+    
+    print(f"[INIT] Starting in {state} state")
+    print("[INIT] Press Ctrl+C to stop\n")
+    
     try:
         while True:
-            # --- LIDAR ---
+            loop_start = time.time()
+            
+            # ================================================================
+            # PERCEPTION
+            # ================================================================
+            
             scan = bot.get_range_image()
-            if scan == -1 or not scan:
-                print("[WARN] LIDAR not ready.")
-                stop(bot)
-                time.sleep(0.1)
+            if scan == -1:
+                time.sleep(LOOP_DT)
                 continue
-            scan_m  = normalize_scan_to_m(scan)
-            front_d = safe_min(scan_m[FRONT_S])
-            left_d  = safe_min(scan_m[LEFT_S])
-
-            # --- Backup if extremely close ---
-            if front_d <= STOP_HARD:
-                print(f"[BACKUP] front={front_d:.2f} m")
-                backup(bot, away_from_left=True)
-                state = WALL_FOLLOW
+            
+            front_d = get_sector_min(scan, FRONT_CENTER, FRONT_SECTOR)
+            left_d = get_sector_min(scan, LEFT_CENTER, LEFT_SECTOR)
+            right_d = get_sector_min(scan, RIGHT_CENTER, RIGHT_SECTOR)
+            
+            landmarks = cam.find_landmarks(min_area=GOAL_AREA)
+            goal_visible = len(landmarks) > 0
+            
+            f_str = f"{front_d:.0f}mm" if front_d else "N/A"
+            l_str = f"{left_d:.0f}mm" if left_d else "N/A"
+            r_str = f"{right_d:.0f}mm" if right_d else "N/A"
+            
+            # ================================================================
+            # GOAL REACHED CHECK
+            # ================================================================
+            
+            if goal_visible:
+                lm = landmarks[0]
+                if lm.width > 200 and front_d and front_d < GOAL_REACHED:
+                    print(f"\n[SUCCESS] Goal reached!")
+                    print(f"[SUCCESS] Width={lm.width}px, Front={front_d:.0f}mm")
+                    bot.stop_motors()
+                    break
+            
+            # ================================================================
+            # EMERGENCY BACKUP
+            # ================================================================
+            
+            if front_d and front_d <= STOP_HARD:
+                print(f"[BACKUP] Too close {front_d:.0f}mm")
+                bot.set_left_motor_speed(BACKUP_SPEED)
+                bot.set_right_motor_speed(BACKUP_SPEED)
+                time.sleep(0.6)
+                bot.stop_motors()
+                time.sleep(0.2)
                 continue
-
-            # --- Camera (pink) ---
-            pink_err = None
-            pink_h   = None
-            boxes    = None
-            if cam is not None:
-                try:
-                    lms = cam.find_landmarks(area_threshold=MIN_AREA)
-                    boxes = parse_boxes(lms)
-                except Exception:
-                    boxes = []
-
-                if boxes:
-                    best = max(boxes, key=lambda b: b[2]*b[3])
-                    pink_err = heading_error_from_box(best, IMG_W)
-                    pink_h   = best[3]
-
-                    # NEW: one-time print when detection toggles ON
-                    if not have_pink:
-                        have_pink = True
-                        x,y,w,h = best
-                        print(f"[GOAL DETECTED] bbox={best}  err={pink_err:+.2f}  tol={tol:.2f}")
-
-                    yes_goal_frames += 1
-                    no_goal_frames = 0
-                else:
-                    # NEW: one-time print when detection toggles OFF
-                    if have_pink:
-                        have_pink = False
-                        print("[GOAL LOST]")
-                    no_goal_frames += 1
-                    yes_goal_frames = 0
-
-                # Adaptive tolerance
-                if no_goal_frames >= NO_GOAL_WIDEN and tol < MAX_TOL:
-                    tol = min(MAX_TOL, tol + 0.02)
-                    cam.set_landmark_colors(PINKS, tolerance=tol)
-                    no_goal_frames = 0
-                    print(f"[CAM] widen tol -> {tol:.2f}")
-                elif yes_goal_frames >= NO_GOAL_SHRINK and tol > BASE_TOL:
-                    tol = max(BASE_TOL, tol - 0.02)
-                    cam.set_landmark_colors(PINKS, tolerance=tol)
-                    yes_goal_frames = 0
-                    print(f"[CAM] shrink tol -> {tol:.2f}")
-
-            # Per-loop camera heartbeat
-            if cam is not None:
-                if boxes:
-                    print(f"[CAM] pink_boxes={len(boxes)}  err={None if pink_err is None else round(pink_err,2)}  h={pink_h}")
-                else:
-                    print("[CAM] no pink")
-
-            # --- State Machine ---
-            if state == GOAL_SEEK:
-                if pink_err is not None:
-                    # Close enough? stop
-                    if pink_h is not None and pink_h >= GOAL_NEAR_H and front_d > STOP_HARD + 0.05:
-                        print(f"[GOAL] reached (bbox_h={pink_h}) — stop")
-                        stop(bot)
-                        break
-
-                    if front_d < TURN_TRIGGER:
-                        # Pivot toward pink
-                        turn = clamp(HEADING_K * pink_err * CRUISE_GOAL, -CRUISE_GOAL, CRUISE_GOAL)
-                        left  = clamp(-turn, -MAX_RPM, MAX_RPM)
-                        right = clamp(+turn, -MAX_RPM, MAX_RPM)
-                        bot.set_left_motor_speed(left)
-                        bot.set_right_motor_speed(right)
-                        print(f"[GOAL_PIVOT] tight front={front_d:.2f} err={pink_err:+.2f}  L={left:.1f} R={right:.1f}")
-                    else:
-                        # Drive toward pink
-                        steer = HEADING_K * pink_err * CRUISE_GOAL
-                        steer = clamp(steer, -0.6*CRUISE_GOAL, 0.6*CRUISE_GOAL)
-                        left  = clamp(CRUISE_GOAL + steer, -MAX_RPM, MAX_RPM)
-                        right = clamp(CRUISE_GOAL - steer, -MAX_RPM, MAX_RPM)
-                        bot.set_left_motor_speed(left)
-                        bot.set_right_motor_speed(right)
-                        print(f"[GOAL_SEEK] err={pink_err:+.2f} h={pink_h}  L={left:.1f} R={right:.1f}  front={front_d:.2f}")
-                else:
-                    # No goal in sight
-                    if front_d > FRONT_CLEAR + 0.2:
-                        bot.set_left_motor_speed(CRUISE_GOAL*0.55)
-                        bot.set_right_motor_speed(CRUISE_GOAL*0.55)
-                        print(f"[SEARCH-FWD] no pink; drift forward  front={front_d:.2f}")
-                    else:
-                        bot.set_left_motor_speed(-SEARCH_RPM)
-                        bot.set_right_motor_speed(+SEARCH_RPM)
-                        print("[SEARCH-SPIN] no pink; spinning to scan")
-
-                    if front_d < TURN_TRIGGER:
-                        print("[STATE] GOAL_SEEK → WALL_FOLLOW (blocked & no pink)")
-                        state = WALL_FOLLOW
-                        stop(bot)
-
-            else:  # WALL_FOLLOW
-                if (pink_err is not None) and (front_d > STOP_HARD + 0.05):
-                    print("[STATE] WALL_FOLLOW → GOAL_SEEK (pink visible)")
-                    state = GOAL_SEEK
-                    stop(bot)
+            
+            # ================================================================
+            # STATE MACHINE
+            # ================================================================
+            
+            if state == STATE_SEARCH:
+                print(f"[{state}] timer={search_timer:.1f}s F={f_str} L={l_str} R={r_str} goal={goal_visible}")
+                
+                if goal_visible:
+                    print(f"[TRANSITION] Goal found -> GOAL_SEEK")
+                    state = STATE_GOAL_SEEK
+                    search_timer = 0
+                    goal_lost_count = 0
+                    bot.stop_motors()
+                    time.sleep(0.2)
                     continue
-
-                if front_d < TURN_TRIGGER:
-                    bot.set_left_motor_speed(+ARC_FAST)
-                    bot.set_right_motor_speed(+ARC_SLOW)
-                    act = "arc right (front tight)"
-                elif left_d > SIDE_TOO_FAR:
-                    bot.set_left_motor_speed(+ARC_SLOW)
-                    bot.set_right_motor_speed(+ARC_FAST)
-                    act = "arc left (left far)"
-                elif left_d < SIDE_TOO_NEAR:
-                    bot.set_left_motor_speed(+ARC_FAST)
-                    bot.set_right_motor_speed(+ARC_SLOW)
-                    act = "arc right (left near)"
+                
+                # Rotate to search
+                bot.set_left_motor_speed(-SEARCH_SPEED)
+                bot.set_right_motor_speed(SEARCH_SPEED)
+                search_timer += LOOP_DT
+                
+                # After full rotation, no goal -> wall follow
+                if search_timer >= SEARCH_TIME:
+                    print(f"[TRANSITION] 360° complete -> WALL_FOLLOW")
+                    state = STATE_WALL_FOLLOW
+                    search_timer = 0
+                    last_side_dist = None
+                    bot.stop_motors()
+                    time.sleep(0.2)
+                    continue
+            
+            elif state == STATE_GOAL_SEEK:
+                print(f"[{state}] F={f_str} L={l_str} R={r_str} goal={goal_visible}")
+                
+                # Check if goal lost
+                if not goal_visible:
+                    goal_lost_count += 1
+                    print(f"[GOAL_SEEK] Goal lost {goal_lost_count}/{GOAL_LOST_THRESHOLD}")
+                    
+                    if goal_lost_count >= GOAL_LOST_THRESHOLD:
+                        print(f"[TRANSITION] Goal lost -> SEARCH")
+                        state = STATE_SEARCH
+                        search_timer = 0
+                        goal_lost_count = 0
+                        bot.stop_motors()
+                        time.sleep(0.2)
+                        continue
+                    else:
+                        # Keep going forward
+                        time.sleep(LOOP_DT)
+                        continue
                 else:
-                    bot.set_left_motor_speed(CRUISE_WALL)
-                    bot.set_right_motor_speed(CRUISE_WALL)
-                    act = "cruise"
-
-                print(f"[WALL_FOLLOW] {act} | front={front_d:.2f} left={left_d:.2f}")
-
-            time.sleep(DT)
-
+                    goal_lost_count = 0
+                
+                lm = landmarks[0]
+                goal_center_x = lm.x
+                image_center = CAM_WIDTH / 2
+                pixel_error = goal_center_x - image_center
+                
+                print(f"[GOAL_SEEK] Goal at ({lm.x}, {lm.y}) size {lm.width}x{lm.height}")
+                print(f"[GOAL_SEEK] Pixel error: {pixel_error:.0f}px (center={image_center:.0f})")
+                
+                # Check for obstacle
+                if front_d and front_d < OBSTACLE_CLOSE:
+                    print(f"[TRANSITION] Obstacle {front_d:.0f}mm -> WALL_FOLLOW")
+                    state = STATE_WALL_FOLLOW
+                    last_side_dist = None
+                    goal_lost_count = 0
+                    bot.stop_motors()
+                    time.sleep(0.2)
+                    continue
+                
+                # Check if goal is centered
+                if abs(pixel_error) < CENTER_TOLERANCE:
+                    # GOAL IS CENTERED - DRIVE STRAIGHT
+                    speed = FORWARD_SPEED
+                    if lm.width > 100:
+                        speed = FORWARD_SPEED * 0.7
+                        print(f"[GOAL_SEEK] Slowing down, close to goal")
+                    
+                    print(f"[GOAL_SEEK] ALIGNED! Driving STRAIGHT at {speed:.1f} RPM")
+                    bot.set_left_motor_speed(speed)
+                    bot.set_right_motor_speed(speed)
+                else:
+                    # GOAL NOT CENTERED - ALIGN FIRST
+                    if pixel_error > 0:
+                        # Goal is to the RIGHT - turn right (slow right wheel)
+                        print(f"[GOAL_SEEK] Goal RIGHT (+{pixel_error:.0f}px) - turning right slowly")
+                        bot.set_left_motor_speed(ALIGN_SPEED)
+                        bot.set_right_motor_speed(ALIGN_SPEED * 0.5)
+                    else:
+                        # Goal is to the LEFT - turn left (slow left wheel)
+                        print(f"[GOAL_SEEK] Goal LEFT ({pixel_error:.0f}px) - turning left slowly")
+                        bot.set_left_motor_speed(ALIGN_SPEED * 0.5)
+                        bot.set_right_motor_speed(ALIGN_SPEED)
+            
+            elif state == STATE_WALL_FOLLOW:
+                print(f"[{state}] F={f_str} L={l_str} R={r_str} goal={goal_visible}")
+                
+                # Goal visible and path clear?
+                if goal_visible and front_d and front_d > FRONT_CLEAR:
+                    print(f"[TRANSITION] Goal visible & clear -> GOAL_SEEK")
+                    state = STATE_GOAL_SEEK
+                    goal_lost_count = 0
+                    bot.stop_motors()
+                    time.sleep(0.2)
+                    continue
+                
+                # Choose wall (prefer right)
+                if right_d and right_d < WALL_GONE:
+                    side_d = right_d
+                    follow_right = True
+                elif left_d and left_d < WALL_GONE:
+                    side_d = left_d
+                    follow_right = False
+                else:
+                    # Wall lost
+                    print(f"[WALL_FOLLOW] No wall, searching...")
+                    bot.set_left_motor_speed(-SEARCH_SPEED)
+                    bot.set_right_motor_speed(SEARCH_SPEED)
+                    time.sleep(1.0)
+                    bot.stop_motors()
+                    last_side_dist = None
+                    continue
+                
+                # PD control
+                error = side_d - TARGET_SIDE
+                d_error = 0
+                if last_side_dist:
+                    d_error = (side_d - last_side_dist) / LOOP_DT
+                last_side_dist = side_d
+                
+                pd = WALL_P * error + WALL_D * d_error
+                
+                # Speed modulation
+                if front_d and front_d < 500:
+                    speed = WALL_SPEED * max(0.4, front_d / 500)
+                else:
+                    speed = WALL_SPEED
+                
+                # Apply differential
+                if follow_right:
+                    left_rpm = speed + pd
+                    right_rpm = speed - pd
+                else:
+                    left_rpm = speed - pd
+                    right_rpm = speed + pd
+                
+                left_rpm = np.clip(left_rpm, -75, 75)
+                right_rpm = np.clip(right_rpm, -75, 75)
+                
+                bot.set_left_motor_speed(left_rpm)
+                bot.set_right_motor_speed(right_rpm)
+            
+            # ================================================================
+            # LOOP TIMING
+            # ================================================================
+            
+            elapsed = time.time() - loop_start
+            sleep_time = LOOP_DT - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    
     except KeyboardInterrupt:
-        print("\n[Bug0] stopped by user.")
+        print("\n[SHUTDOWN] Keyboard interrupt")
+    
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+    
     finally:
-        stop(bot)
-        try:
-            if cam is not None:
-                cam.stop_camera()
-        except Exception:
-            pass
+        print("[SHUTDOWN] Stopping motors and camera...")
+        bot.stop_motors()
+        cam.stop()
+        print("[SHUTDOWN] Complete")
+
 
 if __name__ == "__main__":
     main()
