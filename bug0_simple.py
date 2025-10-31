@@ -2,7 +2,7 @@
 """
 Bug-0 Algorithm - Maze 1 & 2
 
-Maze 1: Direct goal approach
+Maze 1: Direct goal approach (your exact code)
 Maze 2: 2×360° search → right wall follow → goal approach
 """
 
@@ -26,18 +26,18 @@ RIGHT_CENTER = 270
 RIGHT_SECTOR = 15
 
 # Distances (mm)
-GOAL_REACHED = 250
-OBSTACLE_DETECT = 400
-TARGET_WALL = 350
+GOAL_REACHED = 250        # Stop within 0.25m
+OBSTACLE_DETECT = 250     # If front < this, obstacle ahead
+TARGET_WALL = 300
 WALL_LOST = 1500
 
 # Motor speeds
-SEARCH_SPEED = 20
-FORWARD_SPEED = 35
+SEARCH_SPEED = 20         # Rotation speed
+FORWARD_SPEED = 35        # Base forward speed
 WALL_SPEED = 30
-STEER_GAIN = 0.2
-LEFT_BIAS = 1.10
-TEST_MODE = True
+STEER_GAIN = 0.2          # Steering correction (gentle)
+LEFT_BIAS = 1.10          # Left motor boost for straight motion
+TEST_MODE = True          # Set True to test with NO steering, just straight forward
 WALL_P = 0.05
 WALL_D = 0.02
 
@@ -45,17 +45,17 @@ WALL_D = 0.02
 CAM_WIDTH = 640
 CAM_CENTER = 320
 
-# Timing
+# Loop timing
 LOOP_DT = 0.1
-ROTATION_COUNT = 0
-TWO_ROTATIONS = 720  # 2 × 360 degrees
-GOAL_LOST_THRESHOLD = 10  # Need 10 frames (1 sec) without goal to confirm lost
+TWO_ROTATIONS = 720
+GOAL_LOST_THRESHOLD = 10
 
 # ============================================================================
-# HELPERS
+# HELPER
 # ============================================================================
 
 def get_front_distance(scan):
+    """Get minimum front distance."""
     start = (FRONT_CENTER - FRONT_SECTOR) % 360
     end = (FRONT_CENTER + FRONT_SECTOR) % 360
     if start < end:
@@ -84,6 +84,7 @@ def main():
     print("BUG-0 ALGORITHM")
     print("="*50)
     
+    # Initialize
     bot = HamBot(lidar_enabled=True, camera_enabled=True)
     cam = bot.camera
     cam.set_target_colors([GOAL_RGB], tolerance=GOAL_TOL)
@@ -92,6 +93,7 @@ def main():
     print(f"✓ Robot initialized")
     print(f"✓ Looking for PINK goal: {GOAL_RGB}")
     print(f"✓ Left motor bias: {LEFT_BIAS}x")
+    print(f"✓ TEST MODE: {TEST_MODE}")
     print("-"*50 + "\n")
     
     goal_found = False
@@ -104,6 +106,9 @@ def main():
     
     try:
         while True:
+            # ============================================================
+            # SENSE
+            # ============================================================
             scan = bot.get_range_image()
             if scan == -1:
                 time.sleep(LOOP_DT)
@@ -115,16 +120,13 @@ def main():
             goal_visible = len(landmarks) > 0
             
             # ============================================================
-            # SEARCH PHASE - Track 2 full rotations by heading
+            # PHASE 1: SEARCH FOR GOAL
             # ============================================================
-            if not goal_found and not wall_following:
-                # Get current heading
+            if not goal_found and not goal_visible and not wall_following:
                 current_heading = bot.get_heading()
                 
-                # Calculate rotation
                 if last_heading is not None:
                     delta = current_heading - last_heading
-                    # Handle wraparound (359° → 0°)
                     if delta > 180:
                         delta -= 360
                     elif delta < -180:
@@ -133,7 +135,6 @@ def main():
                 
                 last_heading = current_heading
                 
-                # Track if we ever see goal during search
                 if goal_visible:
                     goal_seen_ever = True
                     goal_lost_count = 0
@@ -141,20 +142,18 @@ def main():
                     if goal_seen_ever:
                         goal_lost_count += 1
                 
-                # If we saw goal but lost it for threshold frames, it's really gone
                 if goal_seen_ever and goal_lost_count >= GOAL_LOST_THRESHOLD:
                     print(f"[LOST] Goal disappeared")
                     goal_seen_ever = False
                     goal_lost_count = 0
                 
-                print(f"[SEARCH] {rotation_degrees:.0f}° / 720° F={front_d if front_d else 'N/A'}mm")
+                print(f"[SEARCH] {rotation_degrees:.0f}° / 720° front={front_d if front_d else 'N/A'}mm")
                 bot.set_left_motor_speed(-SEARCH_SPEED)
                 bot.set_right_motor_speed(SEARCH_SPEED)
                 
-                # After 2 full rotations with NO stable goal detection
                 if rotation_degrees >= TWO_ROTATIONS and not goal_visible:
                     print(f"\n[2×360° COMPLETE] No goal after {rotation_degrees:.0f}° rotation")
-                    print(f"[WALL_FOLLOW] Starting careful right wall following\n")
+                    print(f"[WALL_FOLLOW] Starting right wall following\n")
                     wall_following = True
                     rotation_degrees = 0
                     last_heading = None
@@ -163,9 +162,8 @@ def main():
                     bot.stop_motors()
                     time.sleep(0.3)
                 
-                # If goal is visible at end of search, lock on
                 if rotation_degrees >= TWO_ROTATIONS and goal_visible:
-                    print(f"\n[FOUND] Goal confirmed after {rotation_degrees:.0f}° rotation!\n")
+                    print(f"\n[FOUND] Goal confirmed after {rotation_degrees:.0f}°!\n")
                     goal_found = True
                     rotation_degrees = 0
                     last_heading = None
@@ -176,37 +174,33 @@ def main():
                 continue
             
             # ============================================================
-            # WALL FOLLOWING PHASE - Careful and accurate
+            # WALL FOLLOWING PHASE
             # ============================================================
             if wall_following:
                 if goal_visible:
-                    print(f"\n[FOUND] Goal detected during wall follow!\n")
+                    print(f"\n[FOUND] Goal during wall follow!\n")
                     wall_following = False
                     goal_found = True
                     bot.stop_motors()
                     time.sleep(0.3)
                     continue
                 
-                # Check right wall
                 if not right_d or right_d > WALL_LOST:
-                    print(f"[WALL] No right wall, searching...")
+                    print(f"[WALL] No right wall")
                     bot.set_left_motor_speed(-SEARCH_SPEED)
                     bot.set_right_motor_speed(SEARCH_SPEED)
                     time.sleep(LOOP_DT)
                     last_wall_dist = None
                     continue
                 
-                # FRONT OBSTACLE HANDLING - Turn left gradually
-                if front_d and front_d < 300:  # Close to front wall
-                    print(f"[WALL] Front obstacle {front_d:.0f}mm - turning LEFT")
-                    # Turn left in place until front clears
+                if front_d and front_d < 300:
+                    print(f"[WALL] Front {front_d:.0f}mm - turning LEFT")
                     bot.set_left_motor_speed(-15)
                     bot.set_right_motor_speed(15)
                     time.sleep(LOOP_DT)
-                    last_wall_dist = None  # Reset PD control
+                    last_wall_dist = None
                     continue
                 
-                # PD control for smooth wall following
                 error = right_d - TARGET_WALL
                 d_error = 0
                 if last_wall_dist:
@@ -215,14 +209,11 @@ def main():
                 
                 pd = WALL_P * error + WALL_D * d_error
                 
-                # Slow and careful speed
                 if front_d and front_d < 600:
-                    # Slow down as approaching front obstacle
                     speed = WALL_SPEED * max(0.4, front_d / 600)
                 else:
                     speed = WALL_SPEED
                 
-                # Right wall follow: positive error = too far, turn right
                 left_rpm = speed + pd
                 right_rpm = speed - pd
                 
@@ -237,21 +228,24 @@ def main():
                 continue
             
             # ============================================================
-            # GOAL DETECTED
+            # GOAL DETECTED!
             # ============================================================
             if goal_visible and not goal_found:
                 goal_found = True
                 lm = landmarks[0]
-                print(f"\n[FOUND] Goal at ({lm.x}, {lm.y}) size {lm.width}x{lm.height}\n")
+                print(f"\n{'='*50}")
+                print(f"[FOUND] Goal detected at pixel ({lm.x}, {lm.y})")
+                print(f"[FOUND] Size: {lm.width}x{lm.height}")
+                print(f"{'='*50}\n")
                 bot.stop_motors()
                 time.sleep(0.3)
                 continue
             
             # ============================================================
-            # GOAL APPROACH PHASE
+            # PHASE 2: APPROACH GOAL (YOUR EXACT CODE)
             # ============================================================
             if not goal_visible:
-                print(f"[WARNING] Lost goal!")
+                print(f"[WARNING] Lost goal! Stopping.")
                 bot.stop_motors()
                 time.sleep(0.5)
                 goal_found = False
@@ -259,46 +253,60 @@ def main():
             
             lm = landmarks[0]
             
-            # SUCCESS CHECK - LIDAR DISTANCE ONLY
+            # Check if reached goal - LIDAR ONLY
             if front_d and front_d < GOAL_REACHED:
-                print(f"\n[SUCCESS] GOAL REACHED!")
-                print(f"[SUCCESS] Distance: {front_d:.0f}mm ({front_d/1000:.2f}m)\n")
+                print(f"\n{'='*50}")
+                print(f"[SUCCESS] GOAL REACHED!")
+                print(f"[SUCCESS] Final distance: {front_d}mm")
+                print(f"{'='*50}\n")
                 bot.stop_motors()
                 break
             
-            # Obstacle check
-            if front_d and front_d < OBSTACLE_DETECT and lm.width < 150:
-                print(f"[OBSTACLE] Front blocked at {front_d}mm")
+            # Check for obstacle
+            if front_d and front_d < OBSTACLE_DETECT:
+                print(f"[OBSTACLE] Front blocked at {front_d}mm - stopping")
                 bot.stop_motors()
                 break
             
-            # Steering calculation
+            # Calculate steering
             pixel_error = lm.x - CAM_CENTER
             error_normalized = pixel_error / CAM_CENTER
             
-            # Speed adjustment based on goal size
+            # Speed adjustment when close
             if lm.width > 120:
                 speed = FORWARD_SPEED * 0.6
+                status = "CLOSE"
             elif lm.width > 80:
                 speed = FORWARD_SPEED * 0.8
+                status = "NEAR"
             else:
                 speed = FORWARD_SPEED
+                status = "FAR"
             
-            # Motor control
+            # ============================================================
+            # TEST MODE: NO STEERING - Just test straight motion with bias
+            # ============================================================
             if TEST_MODE:
                 left_rpm = speed * LEFT_BIAS
                 right_rpm = speed
+                mode_info = f"TEST MODE (bias={LEFT_BIAS})"
             else:
+                # Apply steering correction
                 steer_correction = STEER_GAIN * error_normalized
                 left_rpm = speed * (1.0 + steer_correction) * LEFT_BIAS
                 right_rpm = speed * (1.0 - steer_correction)
+                mode_info = f"STEER MODE (gain={STEER_GAIN})"
             
+            # Clamp speeds
             left_rpm = np.clip(left_rpm, -75, 75)
             right_rpm = np.clip(right_rpm, -75, 75)
             
-            direction = "R" if pixel_error > 20 else "L" if pixel_error < -20 else "C"
-            print(f"[DRIVE] Goal:({lm.x:3.0f},{lm.y:3.0f}) W:{lm.width:3.0f} "
-                  f"Err:{pixel_error:+4.0f}{direction} L:{left_rpm:.1f} R:{right_rpm:.1f}")
+            # Display info
+            direction = "RIGHT" if pixel_error > 0 else "LEFT" if pixel_error < 0 else "CENTER"
+            print(f"[DRIVE] {status:5s} | Goal: ({lm.x:3.0f}, {lm.y:3.0f}) | "
+                  f"Error: {pixel_error:+4.0f}px {direction:6s} | "
+                  f"Motors: L={left_rpm:4.1f} R={right_rpm:4.1f} | "
+                  f"{mode_info}")
             
             bot.set_left_motor_speed(left_rpm)
             bot.set_right_motor_speed(right_rpm)
